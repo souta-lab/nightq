@@ -1,0 +1,15 @@
+{
+  "name": "nightq",
+  "version": "0.1.0",
+  "description": "A markdown work-queue CLI with a timestamped stream log and stall detection",
+  "type": "module",
+  "module": "src/cli.ts",
+  "bin": {
+    "nightq": "src/cli.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "start": "bun run src/cli.ts"
+  },
+  "license": "MIT"
+}
