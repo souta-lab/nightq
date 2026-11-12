@@ -1,6 +1,6 @@
 {
   "name": "nightq",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A markdown work-queue CLI with a timestamped stream log and stall detection",
   "type": "module",
   "module": "src/cli.ts",

@@ -1,7 +1,7 @@
 import { readFile, writeFile, appendFile, stat, open } from 'node:fs/promises';
 
 export type State = 'TODO' | 'DOING' | 'DONE' | 'BLOCKED';
-export interface QueueItem { number: number; state: State; title: string; notes: string[] }
+export interface QueueItem { number: number; state: State; stateSuffix: string; title: string; notes: string[] }
 export type QueuePart = { kind: 'text'; text: string } | { kind: 'item'; item: QueueItem };
 export interface QueueDoc { items: QueueItem[]; parts: QueuePart[]; trailingNewline: boolean }
 export const QUEUE_TEMPLATE = '# Queue\n\nThe single work list. A watcher monitors this file; workers take items top-down.\nOne item = one deliverable. States: TODO / DOING / DONE / BLOCKED (with a reason note).\n\n## Items\n\n';
@@ -13,10 +13,10 @@ export function parseQueue(text: string): QueueDoc {
   if (doc.trailingNewline || text === '') lines.pop();
   let preceding: QueueItem | undefined;
   for (const line of lines) {
-    const match = /^(\d+)\. \[(TODO|DOING|DONE|BLOCKED)\] (.*)$/.exec(line);
+    const match = /^(\d+)\. \[(TODO|DOING|DONE|BLOCKED)([^\]]*)\] (.*)$/.exec(line);
     const note = /^   - (.*)$/.exec(line);
     if (match) {
-      preceding = { number: doc.items.length + 1, state: match[2] as State, title: match[3]!, notes: [] };
+      preceding = { number: Number(match[1]), state: match[2] as State, stateSuffix: match[3]!, title: match[4]!, notes: [] };
       doc.items.push(preceding);
       doc.parts.push({ kind: 'item', item: preceding });
     } else if (note && preceding) preceding.notes.push(note[1]!);
@@ -26,12 +26,10 @@ export function parseQueue(text: string): QueueDoc {
 }
 
 export function renderQueue(doc: QueueDoc): string {
-  let number = 0;
   return doc.parts.flatMap(part => {
     if (part.kind === 'text') return [part.text];
     const item = part.item;
-    item.number = ++number;
-    return [`${number}. [${item.state}] ${item.title}`, ...item.notes.map(note => `   - ${note}`)];
+    return [`${item.number}. [${item.state}${item.stateSuffix}] ${item.title}`, ...item.notes.map(note => `   - ${note}`)];
   }).join('\n') + (doc.trailingNewline ? '\n' : '');
 }
 
@@ -41,7 +39,8 @@ function singleLine(value: string, label: string): void {
 export function addItem(doc: QueueDoc, title: string, note?: string): QueueItem {
   singleLine(title, 'Title');
   if (note !== undefined) singleLine(note, 'Note');
-  const item: QueueItem = { number: doc.items.length + 1, state: 'TODO', title, notes: note === undefined ? [] : [note] };
+  const number = doc.items.reduce((max, item) => Math.max(max, item.number), 0) + 1;
+  const item: QueueItem = { number, state: 'TODO', stateSuffix: '', title, notes: note === undefined ? [] : [note] };
   let position = doc.parts.length;
   for (let i = doc.parts.length - 1; i >= 0; i--) {
     if (doc.parts[i]!.kind === 'item') { position = i + 1; break; }
@@ -52,8 +51,11 @@ export function addItem(doc: QueueDoc, title: string, note?: string): QueueItem 
   return item;
 }
 export function setState(doc: QueueDoc, n: number, state: State, note?: string): QueueItem {
-  if (!Number.isSafeInteger(n) || n < 1 || n > doc.items.length) throw new Error(`Item ${n} is out of range`);
-  const item = doc.items[n - 1]!;
+  if (!Number.isSafeInteger(n) || n < 1) throw new Error(`Item ${n} is out of range`);
+  const matches = doc.items.filter(item => item.number === n);
+  if (matches.length === 0) throw new Error(`Item ${n} is out of range`);
+  if (matches.length > 1) throw new Error(`Item ${n} is ambiguous: duplicate numbers in queue`);
+  const item = matches[0]!;
   if (state === 'DOING' && item.state === 'DONE') throw new Error(`Item ${n} is DONE and cannot be claimed`);
   if (note !== undefined) singleLine(note, state === 'BLOCKED' ? 'Reason' : 'Note');
   if (state === 'BLOCKED' && note === undefined) throw new Error('A block reason is required');
@@ -75,7 +77,34 @@ async function createFile(path: string, text: string): Promise<boolean> {
     return true;
   } catch (error) { if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false; throw error; }
 }
-function time(now: Date): string { return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`; }
+export function timeZone(): string { return process.env.NIGHTQ_TZ || 'Asia/Tokyo'; }
+const formatters = new Map<string, Intl.DateTimeFormat>();
+function zoneFormatter(tz: string): Intl.DateTimeFormat {
+  let formatter = formatters.get(tz);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    formatters.set(tz, formatter);
+  }
+  return formatter;
+}
+function zoneParts(date: Date, tz: string): { year: number; month: number; day: number; hour: number; minute: number; second: number } {
+  const parts: Record<string, number> = {};
+  for (const part of zoneFormatter(tz).formatToParts(date)) if (part.type !== 'literal') parts[part.type] = Number(part.value);
+  return { year: parts.year!, month: parts.month!, day: parts.day!, hour: parts.hour! % 24, minute: parts.minute!, second: parts.second! };
+}
+function time(now: Date): string {
+  const parts = zoneParts(now, timeZone());
+  return `${String(parts.hour).padStart(2, '0')}:${String(parts.minute).padStart(2, '0')}`;
+}
+function instantAtZoneTime(year: number, month: number, day: number, hour: number, minute: number, tz: string): Date {
+  const target = Date.UTC(year, month - 1, day, hour, minute, 0);
+  let guess = target;
+  for (let i = 0; i < 2; i++) {
+    const parts = zoneParts(new Date(guess), tz);
+    guess += target - Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
+  }
+  return new Date(guess);
+}
 export async function appendLog(logPath: string, message: string, now = new Date()): Promise<void> {
   singleLine(message, 'Message');
   await createFile(logPath, LOG_TEMPLATE);
@@ -85,9 +114,9 @@ export async function appendLog(logPath: string, message: string, now = new Date
 export function parseLogTime(line: string, now = new Date()): Date | null {
   const match = /^- \[(\d{2}):(\d{2})\] /.exec(line);
   if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) return null;
-  const date = new Date(now);
-  date.setHours(Number(match[1]), Number(match[2]), 0, 0);
-  return date;
+  const tz = timeZone();
+  const today = zoneParts(now, tz);
+  return instantAtZoneTime(today.year, today.month, today.day, Number(match[1]), Number(match[2]), tz);
 }
 export function parseDuration(s: string): number {
   const match = /^(\d+(?:\.\d+)?)([smh]?)$/.exec(s);
@@ -101,7 +130,8 @@ export async function checkWatch(queuePath: string, logPath: string, stallMs: nu
   let lastUpdate = info.mtime;
   for (const line of log.split('\n')) {
     const timestamp = parseLogTime(line, now);
-    if (timestamp && timestamp > lastUpdate) lastUpdate = timestamp;
+    // A timestamp more than 5 minutes in the future is a wrong-clock writer; it must not mask a stall.
+    if (timestamp && timestamp.getTime() <= now.getTime() + 5 * 60_000 && timestamp > lastUpdate) lastUpdate = timestamp;
   }
   const doingCount = doc.items.filter(item => item.state === 'DOING').length;
   const ageMs = now.getTime() - lastUpdate.getTime();
@@ -164,7 +194,7 @@ export async function runCli(argv: string[], print: (text: string) => void = con
   catch (error) { if (command === 'add' && isMissing(error)) doc = parseQueue(QUEUE_TEMPLATE); else throw error; }
   if (command === 'list') {
     if (args.length) throw new Error('list takes no arguments');
-    for (const item of doc.items) print(`${item.number}. [${item.state}] ${item.title}`);
+    for (const item of doc.items) print(`${item.number}. [${item.state}${item.stateSuffix}] ${item.title}`);
     const count = (state: State) => doc.items.filter(item => item.state === state).length;
     print(`— ${count('TODO')} todo, ${count('DOING')} doing, ${count('DONE')} done, ${count('BLOCKED')} blocked`);
     return 0;
@@ -181,7 +211,8 @@ export async function runCli(argv: string[], print: (text: string) => void = con
   }
   await saveQueue(queue, doc);
   const verb = command === 'add' ? 'added' : command === 'claim' ? 'claimed' : command === 'done' ? 'done' : 'blocked';
-  await appendLog(log, `Item ${item.number} ${verb}: ${item.title}${command === 'block' ? ` — ${args.join(' ')}` : ''}`);
+  const logTitle = item.title.length > 120 ? `${item.title.slice(0, 120)}…` : item.title;
+  await appendLog(log, `Item ${item.number} ${verb}: ${logTitle}${command === 'block' ? ` — ${args.join(' ')}` : ''}`);
   print(command === 'add' ? `Added #${item.number}: ${item.title}` : `Item ${item.number} ${verb}: ${item.title}`);
   return 0;
 }

@@ -67,15 +67,56 @@ describe('watch', () => {
     expect((await checkWatch(queue, log, 20 * 60_000, now)).ageMs).toBe(5 * 60_000);
   });
   test('threshold is strictly greater', async () => { expect((await fixture('DOING', 20)).stalled).toBe(false); });
+  test('far-future log timestamps do not mask a stall', async () => {
+    await writeFile(queue, '# Queue\n\n1. [DOING] Work\n');
+    // `now` is 21:00 in Asia/Tokyo: [20:00] is 60 minutes ago, [23:59] is ~3h in the future (wrong-clock writer)
+    await writeFile(log, '# Stream Log\n\n- [20:00] Old progress\n- [23:59] Wrong-clock entry\n');
+    const old = new Date(now.getTime() - 3 * 60 * 60_000);
+    await utimes(queue, old, old);
+    const result = await checkWatch(queue, log, 20 * 60_000, now);
+    expect(result.stalled).toBe(true);
+    expect(result.ageMs).toBe(60 * 60_000);
+  });
   test('missing files fail', async () => { await expect(checkWatch(queue, log, 100, now)).rejects.toThrow(); });
 });
 
-test('round trip preserves prose and blank lines and resequences', () => {
+test('round trip preserves prose, blank lines, and literal numbers', () => {
   const original = '# Queue\n\nIntro\n9. [TODO] One\n   - Note\n\nBetween\n42. [DOING] Two\n\nFooter\n';
   const doc = parseQueue(original);
-  expect(renderQueue(doc)).toBe(original.replace('9.', '1.').replace('42.', '2.'));
+  expect(renderQueue(doc)).toBe(original);
   addItem(doc, 'Three');
-  expect(renderQueue(doc)).toContain('2. [DOING] Two\n3. [TODO] Three\n\nFooter');
+  expect(renderQueue(doc)).toContain('42. [DOING] Two\n43. [TODO] Three\n\nFooter');
+});
+test('decorated state bracket parses, round-trips, and keeps its suffix on state change', () => {
+  const line = '33. [DONE（マージ+push）／デプロイ BLOCKED（VM に Cloudflare 認証なし）] QUEST 2ブランチのマージ＋push＋本番デプロイ';
+  const doc = parseQueue(line + '\n');
+  expect(doc.items).toHaveLength(1);
+  expect(doc.items[0]).toMatchObject({ number: 33, state: 'DONE' });
+  expect(renderQueue(doc)).toBe(line + '\n');
+  setState(doc, 33, 'BLOCKED', 'test reason');
+  expect(renderQueue(doc)).toContain('33. [BLOCKED（マージ+push）／デプロイ BLOCKED（VM に Cloudflare 認証なし）] QUEST');
+});
+test('items are addressed by literal number across gaps and out-of-order sections', () => {
+  const doc = parseQueue('40. [TODO] Forty\n9. [TODO] Nine\n42. [DONE] Forty-two\n');
+  setState(doc, 9, 'DOING');
+  expect(doc.items.find(i => i.number === 9)?.state).toBe('DOING');
+  expect(doc.items.find(i => i.number === 40)?.state).toBe('TODO');
+  expect(() => setState(doc, 41, 'DONE')).toThrow('out of range');
+  const added = addItem(doc, 'Next');
+  expect(added.number).toBe(43);
+  expect(renderQueue(doc)).toContain('42. [DONE] Forty-two\n43. [TODO] Next');
+});
+test('duplicate literal numbers are ambiguous and rejected', () => {
+  const doc = parseQueue('1. [TODO] A\n1. [TODO] B\n');
+  expect(() => setState(doc, 1, 'DONE')).toThrow('duplicate');
+});
+test('auto log truncates very long titles', async () => {
+  const title = 'Long '.repeat(50).trim();
+  await cli('add', title);
+  await cli('done', '1');
+  const line = (await readFile(log, 'utf8')).split('\n').find(l => l.includes('Item 1 done'))!;
+  expect(line).toContain('…');
+  expect(line.length).toBeLessThan(180);
 });
 test('orphan notes and unterminated text round trip', () => {
   const text = '# Heading\n   - orphan\n1. [TODO] Work\n\n   - separated\nTail';
@@ -85,10 +126,10 @@ test('parse durations and reject invalid values', () => {
   for (const [input, expected] of [['20m', 1_200_000], ['90s', 90_000], ['1h', 3_600_000], ['45', 45_000]] as const) expect(parseDuration(input)).toBe(expected);
   for (const value of ['', '-1', '20x', 'Infinity', '1m junk']) expect(() => parseDuration(value)).toThrow();
 });
-test('log formatting uses local supplied time and inserts missing newline', async () => {
+test('log formatting uses the configured zone (default Asia/Tokyo) and inserts missing newline', async () => {
   await writeFile(log, '# Stream Log');
-  await appendLog(log, 'Hello', new Date(2026, 1, 1, 1, 3));
-  expect(await readFile(log, 'utf8')).toBe('# Stream Log\n- [01:03] Hello\n');
+  await appendLog(log, 'Hello', new Date(Date.UTC(2026, 0, 31, 15, 3)));
+  expect(await readFile(log, 'utf8')).toBe('# Stream Log\n- [00:03] Hello\n');
   expect(parseLogTime('- [25:00] invalid')).toBeNull();
 });
 test('init creates templates and never overwrites', async () => {

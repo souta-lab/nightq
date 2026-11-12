@@ -20,6 +20,7 @@ It was built for long-running, semi-autonomous work sessions (overnight coding r
 - [File format](#-file-format)
 - [Design](#-design)
 - [Development](#-development)
+- [Changelog](#-changelog)
 - [License](#-license)
 
 ## 🤔 Why
@@ -136,6 +137,8 @@ $ echo $?
 
 If at least one item is `DOING` and the last update is older than the threshold, it prints `STALLED` and exits `1`. In every other situation (including "nothing is DOING") it prints `OK` and exits `0`. Durations accept `20m`, `90s`, `1h`, or a bare number of seconds. Drop it into a cron job or a heartbeat loop and alert on the exit code — that's the whole integration.
 
+Log timestamps are interpreted in one configured time zone (`NIGHTQ_TZ`, default `Asia/Tokyo`), and a log timestamp more than 5 minutes in the future is treated as a wrong-clock writer and ignored — it cannot mask a real stall.
+
 ## 📄 File format
 
 Items are numbered lines; notes are indented sub-bullets; a block reason is a note prefixed with `BLOCKED: `.
@@ -146,11 +149,11 @@ N. [STATE] title
    - BLOCKED: the reason, for BLOCKED items
 ```
 
-`STATE` is one of `TODO` / `DOING` / `DONE` / `BLOCKED`. Parsing is tolerant: headings, prose and blank lines anywhere in the file are preserved verbatim on rewrite, and item numbers are re-sequenced in file order. You can edit the queue in your editor mid-run; the CLI will not fight you.
+`STATE` is one of `TODO` / `DOING` / `DONE` / `BLOCKED`. Parsing is tolerant: headings, prose and blank lines anywhere in the file are preserved verbatim on rewrite. **Item numbers are stable identities, not positions** — they are preserved exactly as written (gaps and out-of-order sections are fine), prose elsewhere in the file can safely refer to items by number, and a new item gets `max + 1`. Text after the state inside the brackets (e.g. `33. [DONE（merged, deploy pending）] ...`) is kept as an annotation suffix and survives state changes. Notes indented with anything other than the canonical three spaces are preserved as prose, untouched. Log timestamps are stamped and read in the `NIGHTQ_TZ` zone (default `Asia/Tokyo`). You can edit the queue in your editor mid-run; the CLI will not fight you.
 
 ## 🧩 Design
 
-- **Zero dependencies.** Only Bun/Node built-ins. `bun test` runs the full suite (18 tests).
+- **Zero dependencies.** Only Bun/Node built-ins. `bun test` runs the full suite (23 tests).
 - **Files over processes.** All state is in the two markdown files; every command is a short-lived process that reads, mutates, and writes.
 - **Library first.** `src/queue.ts` holds the parsing, state transitions and stall logic; `src/cli.ts` is a thin entry point, so the behavior is unit-testable without spawning the CLI.
 
@@ -160,6 +163,21 @@ N. [STATE] title
 bun test          # run the test suite
 bun run src/cli.ts --help
 ```
+
+## 📝 Changelog
+
+### v0.2.0 — dogfooded on a real night queue
+
+Found by running nightq against the live queue it was built for (64 items, mixed sections, prose completion records):
+
+- **Item numbers are now stable identities.** v0.1 renumbered items positionally on every rewrite; on a file whose numbers are referenced from prose and logs (and which has gaps and out-of-order sections) a no-op load/save rewrote 90 lines and shifted every reference. Numbers are preserved verbatim, commands address items by their literal number, duplicates are rejected, and new items get `max + 1`.
+- **Decorated state brackets parse.** A state annotation such as `[DONE（merged, deploy pending）]` made the item invisible to v0.1. The suffix is now parsed, preserved on rewrite, and kept across state changes.
+- **One clock for the log.** v0.1 stamped and parsed log times in the machine's local zone while the real log mixes writers; timestamps are now handled in `NIGHTQ_TZ` (default `Asia/Tokyo`), and log timestamps more than 5 minutes in the future are ignored by `watch` instead of masking stalls.
+- **Auto-log lines truncate long titles** (120 chars) so paragraph-length item titles no longer flood the stream log.
+
+### v0.1.0
+
+- Initial release: init / add / list / claim / done / block / log / watch over two markdown files.
 
 ## 📜 License
 
